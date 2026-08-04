@@ -444,8 +444,21 @@ def _overlapping(a: Path, b: Path) -> bool:
 
 
 def backup_name_for(target: Path) -> str:
-    """Unique, collision-free backup name derived from the full target path."""
-    return target.as_posix().lstrip("/").replace("/", "__") or "root"
+    """Collision-free backup name: SHA-256 of the absolute path + basename.
+
+    A separator-substitution scheme ("/" -> "__") would collide for
+    ``/a/b__c`` vs ``/a/b/c``; hashing the full path cannot.
+    """
+    digest = hashlib.sha256(target.as_posix().encode("utf-8")).hexdigest()[:16]
+    return f"{digest}__{target.name or 'root'}"
+
+
+def _samefile(a: Path, b: Path) -> bool:
+    """True when both paths exist and are the same file (case-alias safe)."""
+    try:
+        return os.path.samefile(str(a), str(b))
+    except OSError:
+        return False
 
 
 def preflight_links(
@@ -460,6 +473,8 @@ def preflight_links(
     protected = [Path("/"), Path.home().resolve(), workspace.resolve()]
     seen_targets: Set[str] = set()
     accepted_targets: List[Path] = []
+    planned_backups: Set[str] = set()
+    backups_norm = backups.resolve()
 
     for index, entry in enumerate(spec.get("links", [])):
         label = f"links[{index}]"
@@ -481,52 +496,83 @@ def preflight_links(
         # an existing wrong symlink is still seen as a symlink.
         target = target.parent.resolve() / target.name
 
+        # samefile checks are for REAL files/dirs only: a symlink target is
+        # judged by the noop/relink logic (replacing a symlink loses no data),
+        # and samefile would follow it and misfire on the already-linked case.
+        target_is_symlink = target.is_symlink()
+        rejected = False
         for danger in protected:
-            if _is_same_or_ancestor(target, danger):
+            if _is_same_or_ancestor(target, danger) or (
+                not target_is_symlink and _samefile(target, danger)
+            ):
                 issues.append(
                     f"{label}: refusing dangerous target {target} "
-                    f"(equals or contains {danger})"
+                    f"(equals, aliases, or contains {danger})"
                 )
+                rejected = True
                 break
-        else:
-            source_abs = source.resolve()
-            if target == source_abs or _overlapping(target, source_abs):
-                issues.append(f"{label}: target overlaps its own source: {target}")
-            elif str(target) in seen_targets:
-                issues.append(f"{label}: duplicate target: {target}")
+        if rejected:
+            continue
+
+        source_abs = source.resolve()
+        if target == source_abs or _overlapping(target, source_abs):
+            issues.append(f"{label}: target overlaps its own source: {target}")
+            continue
+        if not target_is_symlink and _samefile(target, source):
+            issues.append(
+                f"{label}: target aliases its own source (samefile, e.g. a "
+                f"case-insensitive filesystem): {target}"
+            )
+            continue
+        if _overlapping(backups_norm, target) or _overlapping(backups_norm, source_abs):
+            issues.append(
+                f"{label}: backup directory overlaps a link source/target: "
+                f"{backups_norm} <-> {target}"
+            )
+            continue
+        if str(target) in seen_targets:
+            issues.append(f"{label}: duplicate target: {target}")
+            continue
+        overlap = next(
+            (previous for previous in accepted_targets
+             if _overlapping(target, previous) or _samefile(target, previous)),
+            None,
+        )
+        if overlap is not None:
+            issues.append(
+                f"{label}: target overlaps another target: {target} <-> {overlap}"
+            )
+            continue
+
+        action, detail = "link_new", ""
+        if target.is_symlink():
+            raw_link = os.readlink(target)
+            current = Path(raw_link)
+            resolved = (
+                (target.parent / current).resolve()
+                if not current.is_absolute() else current.resolve()
+            )
+            if resolved == source.resolve():
+                action = "noop"
             else:
-                for previous in accepted_targets:
-                    if _overlapping(target, previous):
-                        issues.append(
-                            f"{label}: target overlaps another target: "
-                            f"{target} <-> {previous}"
-                        )
-                        break
-                else:
-                    action, detail = "link_new", ""
-                    if target.is_symlink():
-                        current = Path(os.readlink(target))
-                        resolved = (
-                            (target.parent / current).resolve()
-                            if not current.is_absolute() else current.resolve()
-                        )
-                        if resolved == source.resolve():
-                            action = "noop"
-                        else:
-                            action, detail = "relink", str(resolved)
-                    elif target.exists():
-                        action = "backup_link"
-                        backup_dest = backups / backup_name_for(target)
-                        if backup_dest.exists():
-                            issues.append(f"{label}: backup collision: {backup_dest}")
-                            continue
-                        detail = str(backup_dest)
-                    seen_targets.add(str(target))
-                    accepted_targets.append(target)
-                    plan.append(
-                        {"action": action, "source": source, "target": target,
-                         "detail": detail, "label": label}
-                    )
+                action, detail = "relink", raw_link
+        elif target.exists():
+            action = "backup_link"
+            backup_dest = backups / backup_name_for(target)
+            if backup_dest.exists():
+                issues.append(f"{label}: backup collision: {backup_dest}")
+                continue
+            if str(backup_dest) in planned_backups:
+                issues.append(f"{label}: planned backup destination collides: {backup_dest}")
+                continue
+            planned_backups.add(str(backup_dest))
+            detail = str(backup_dest)
+        seen_targets.add(str(target))
+        accepted_targets.append(target)
+        plan.append(
+            {"action": action, "source": source, "target": target,
+             "detail": detail, "label": label}
+        )
     return plan, issues
 
 
@@ -541,15 +587,32 @@ def _write_ledger(backups: Path, moved: List[Tuple[Path, Path]]) -> None:
     )
 
 
-def _rollback(created: List[Path], moved: List[Tuple[Path, Path]], log: List[str]) -> None:
-    for link in reversed(created):
+def _rollback(
+    created_links: List[Path],
+    created_dirs: List[Path],
+    moved: List[Tuple[Path, Path]],
+    relinked: List[Tuple[Path, str]],
+    log: List[str],
+) -> None:
+    """Undo a partially executed plan completely, newest change first."""
+    for link in reversed(created_links):
         if link.is_symlink():
             link.unlink()
             log.append(f"ROLLBACK unlink: {link}")
+    for target, old_link in reversed(relinked):
+        if not target.exists() and not target.is_symlink():
+            os.symlink(old_link, target)
+            log.append(f"ROLLBACK relink restored: {target} -> {old_link}")
     for original, backup in reversed(moved):
         if backup.exists() and not original.exists():
             shutil.move(str(backup), str(original))
             log.append(f"ROLLBACK restore: {backup} -> {original}")
+    for directory in reversed(created_dirs):
+        try:
+            directory.rmdir()
+            log.append(f"ROLLBACK rmdir: {directory}")
+        except OSError:
+            pass  # not empty or already gone; never force-delete
 
 
 def apply_links(
@@ -586,14 +649,31 @@ def apply_links(
     if dry_run:
         return log, issues
 
-    created: List[Path] = []
+    created_links: List[Path] = []
+    created_dirs: List[Path] = []
     moved: List[Tuple[Path, Path]] = []
+    relinked: List[Tuple[Path, str]] = []
+
+    def write_journal() -> None:
+        backups.mkdir(parents=True, exist_ok=True)
+        data = {
+            "moved": [{"original": str(o), "backup": str(b)} for o, b in moved],
+            "relinked": [{"target": str(t), "old_link": raw} for t, raw in relinked],
+            "created_links": [str(p) for p in created_links],
+            "created_dirs": [str(p) for p in created_dirs],
+        }
+        (backups / "transaction_journal.json").write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8"
+        )
+
     try:
         for item in plan:
             target: Path = item["target"]
             if item["action"] == "noop":
                 continue
             if item["action"] == "relink":
+                relinked.append((target, item["detail"]))
+                write_journal()
                 target.unlink()
             elif item["action"] == "backup_link":
                 backup_dest = Path(item["detail"])
@@ -601,11 +681,22 @@ def apply_links(
                 shutil.move(str(target), str(backup_dest))
                 moved.append((target, backup_dest))
                 _write_ledger(backups, moved)
-            target.parent.mkdir(parents=True, exist_ok=True)
+                write_journal()
+            missing_parents: List[Path] = []
+            probe = target.parent
+            while not probe.exists():
+                missing_parents.append(probe)
+                probe = probe.parent
+            for directory in reversed(missing_parents):
+                directory.mkdir()
+                created_dirs.append(directory)
+            if missing_parents:
+                write_journal()
             target.symlink_to(item["source"])
-            created.append(target)
+            created_links.append(target)
+            write_journal()
     except OSError as exc:
-        _rollback(created, moved, log)
+        _rollback(created_links, created_dirs, moved, relinked, log)
         issues.append(f"link execution failed and was rolled back: {exc}")
         return log, issues
     if moved:
@@ -644,7 +735,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         spec = load_spec(spec_path)
         if args.manifest is not None:
-            manifest_path = Path(os.path.abspath(args.manifest))
+            # Fully resolve (symlinks in every existing component included)
+            # BEFORE the containment decision, so a symlink inside the
+            # workspace cannot smuggle the write outside it.
+            manifest_path = args.manifest.expanduser().resolve()
             try:
                 manifest_path.relative_to(workspace)
             except ValueError:

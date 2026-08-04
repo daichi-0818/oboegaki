@@ -4,7 +4,7 @@
 Markdown + Git + symlinks. No database, no embeddings, no LLM calls, no
 daemon, no API keys. One stdlib-only Python file.
 
-[![tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)](tests/)
+[![tests](https://img.shields.io/badge/tests-51%20passing-brightgreen)](tests/)
 [![zero-api](https://img.shields.io/badge/network%20calls-0%20(test--enforced)-blue)](tests/test_zero_api.py)
 
 ## Why
@@ -90,15 +90,23 @@ is fully reproducible. Automation and judgment never share a file.
 
 - **Dry-run everything**: `link --dry-run` prints the exact plan.
 - **Preflight before write**: every link entry is validated first; any
-  rejection (dangerous target, overlap, duplicate, backup collision)
+  rejection (dangerous target incl. case-insensitive aliases via
+  `samefile`, source/target overlap, nested or duplicate targets, backup
+  directory overlapping a source/target, planned-backup collisions)
   blocks the whole run before a single write happens.
-- **Timestamped backups + restore ledger**: a real directory at a link
-  target is moved to a backup folder named after its full path (collision
-  free), never removed, and recorded in `restore_ledger.json`. Wrong
-  symlinks are retargeted (a symlink holds no data); real data is only
-  ever moved, never deleted. Mid-failure triggers automatic rollback.
+- **Timestamped backups + restore ledger + transaction journal**: a real
+  directory at a link target is moved to a backup folder named by the
+  SHA-256 of its absolute path (collision free by construction), never
+  removed, and recorded in `restore_ledger.json`. Every mutation —
+  moves, replaced symlinks (with their original link text), created
+  parent directories, created links — is journalled to
+  `transaction_journal.json` as it happens; mid-failure triggers a
+  complete automatic rollback including restoring replaced symlinks and
+  removing created parent directories.
 - **Idempotent**: re-running `link` on a wired workspace changes nothing.
-- **Path containment**: spec paths may not escape the workspace.
+- **Path containment**: spec paths may not escape the workspace, and
+  `--manifest` is fully symlink-resolved before its containment check —
+  a symlink inside the workspace cannot smuggle the write outside.
 - **CRLF-stable hashing**: line endings are normalised before hashing, so
   a repo shared between macOS/Linux/WSL doesn't produce false staleness.
 - **Zero API, test-enforced**: [`tests/test_zero_api.py`](tests/test_zero_api.py)

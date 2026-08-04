@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -400,6 +401,170 @@ class NewCheckSemanticsTest(unittest.TestCase):
                     for i in issues),
                 issues,
             )
+
+
+def _fs_case_insensitive(directory: Path) -> bool:
+    probe = directory / "CaseProbe_memkit"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return (directory / "caseprobe_memkit").exists()
+    finally:
+        probe.unlink()
+
+
+class TransactionSafetyTest(unittest.TestCase):
+    """Fault injections for the five hardening classes of review round 2."""
+
+    def test_manifest_symlink_escape_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ws = base / "ws"
+            ws.mkdir()
+            make_min_workspace(ws)
+            outside = base / "outside"
+            outside.mkdir()
+            (ws / "escape").symlink_to(outside)
+            code, out, err = run_cli(
+                ["refresh", "--workspace", str(ws),
+                 "--manifest", str(ws / "escape" / "m.json")]
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("must stay inside the workspace", err)
+            self.assertEqual(list(outside.iterdir()), [],
+                             "nothing may be written through the symlink")
+
+    def test_case_alias_of_source_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if not _fs_case_insensitive(root):
+                self.skipTest("requires a case-insensitive filesystem")
+            spec = make_min_workspace(root)
+            spec["links"] = [{"source": "memory", "target": "Memory"}]
+            spec["link_backup_dir"] = "backups"
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertTrue(
+                any("aliases its own source" in i or "dangerous target" in i
+                    for i in issues),
+                issues,
+            )
+            self.assertTrue((root / "memory" / "MEMORY.md").is_file(),
+                            "source must remain untouched")
+
+    def test_backup_names_cannot_collide_for_tricky_paths(self) -> None:
+        a = memkit.backup_name_for(Path("/a/b__c"))
+        b = memkit.backup_name_for(Path("/a/b/c"))
+        self.assertNotEqual(a, b, "separator-substitution collision is back")
+
+    def test_planned_backup_duplicate_is_rejected_in_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            for name in ("a", "b"):
+                real = root / "live" / name
+                real.mkdir(parents=True)
+                (real / "data.md").write_text("x\n", encoding="utf-8")
+            spec["links"] = [
+                {"source": "memory", "target": "live/a"},
+                {"source": "memory", "target": "live/b"},
+            ]
+            spec["link_backup_dir"] = "backups"
+            original_namer = memkit.backup_name_for
+            memkit.backup_name_for = lambda target: "constant"  # type: ignore[assignment]
+            try:
+                log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            finally:
+                memkit.backup_name_for = original_namer  # type: ignore[assignment]
+            self.assertTrue(any("planned backup destination collides" in i for i in issues))
+            self.assertFalse((root / "backups").exists())
+
+    def test_backup_root_overlapping_target_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            spec["links"] = [{"source": "memory", "target": "live/memory"}]
+            spec["link_backup_dir"] = "live/memory/backups"
+            (root / "live" / "memory").mkdir(parents=True)
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertTrue(any("backup directory overlaps" in i for i in issues))
+            self.assertFalse((root / "live" / "memory").is_symlink())
+
+    def test_failed_relink_restores_original_symlink_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            spec["links"] = [{"source": "memory", "target": "live/memory"}]
+            spec["link_backup_dir"] = "backups"
+            other = root / "other"
+            other.mkdir()
+            live = root / "live" / "memory"
+            live.parent.mkdir(parents=True)
+            live.symlink_to(other)
+            old_text = os.readlink(live)
+
+            original_symlink_to = Path.symlink_to
+
+            def always_fail(self_path, target_path):  # noqa: ANN001
+                raise OSError("injected: symlink creation denied")
+
+            Path.symlink_to = always_fail  # type: ignore[method-assign]
+            try:
+                log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            finally:
+                Path.symlink_to = original_symlink_to  # type: ignore[method-assign]
+
+            self.assertTrue(any("rolled back" in i for i in issues))
+            self.assertTrue(live.is_symlink(), "original symlink must be restored")
+            self.assertEqual(os.readlink(live), old_text)
+
+    def test_failed_link_removes_created_parent_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            spec["links"] = [{"source": "memory", "target": "deep/nested/memory"}]
+            spec["link_backup_dir"] = "backups"
+
+            original_symlink_to = Path.symlink_to
+
+            def always_fail(self_path, target_path):  # noqa: ANN001
+                raise OSError("injected: symlink creation denied")
+
+            Path.symlink_to = always_fail  # type: ignore[method-assign]
+            try:
+                log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            finally:
+                Path.symlink_to = original_symlink_to  # type: ignore[method-assign]
+
+            self.assertTrue(any("rolled back" in i for i in issues))
+            self.assertFalse((root / "deep").exists(),
+                             "created parent directories must be removed")
+
+    def test_transaction_journal_records_relink_and_moves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            spec["links"] = [
+                {"source": "memory", "target": "live/wrong"},
+                {"source": "memory", "target": "live/real"},
+            ]
+            spec["link_backup_dir"] = "backups"
+            other = root / "other"
+            other.mkdir()
+            wrong = root / "live" / "wrong"
+            wrong.parent.mkdir(parents=True)
+            wrong.symlink_to(other)
+            real = root / "live" / "real"
+            real.mkdir()
+            (real / "x.md").write_text("x\n", encoding="utf-8")
+
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertEqual(issues, [])
+            journal = json.loads(
+                (root / "backups" / "t1" / "transaction_journal.json").read_text()
+            )
+            self.assertEqual(len(journal["relinked"]), 1)
+            self.assertTrue(journal["relinked"][0]["old_link"].endswith("other"))
+            self.assertEqual(len(journal["moved"]), 1)
+            self.assertEqual(len(journal["created_links"]), 2)
 
 
 class CliTest(unittest.TestCase):
