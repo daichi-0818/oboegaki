@@ -7,7 +7,7 @@ have Python 3.9+, copy or clone, run.
 
 ```bash
 python3 --version              # 3.9+ (ships with Xcode CLT / homebrew)
-git clone <this-repo> && cd oboegaki
+git clone https://github.com/daichi-0818/oboegaki.git && cd oboegaki
 python3 memkit.py check --workspace samples/demo
 ```
 
@@ -15,7 +15,7 @@ python3 memkit.py check --workspace samples/demo
 
 ```bash
 sudo apt-get install -y python3 git   # if missing
-git clone <this-repo> && cd oboegaki
+git clone https://github.com/daichi-0818/oboegaki.git && cd oboegaki
 python3 memkit.py check --workspace samples/demo
 ```
 
@@ -26,7 +26,7 @@ Run inside your WSL distribution (Ubuntu recommended). Symlinks created by
 
 ```bash
 sudo apt-get install -y python3 git
-git clone <this-repo> && cd oboegaki
+git clone https://github.com/daichi-0818/oboegaki.git && cd oboegaki
 python3 memkit.py check --workspace samples/demo
 ```
 

@@ -41,7 +41,7 @@ re-approves the context. Stale memory is *detected*, not silently trusted.
 ## Quickstart
 
 ```bash
-git clone <this-repo> && cd oboegaki
+git clone https://github.com/daichi-0818/oboegaki.git && cd oboegaki
 python3 memkit.py check --workspace samples/demo     # PASS on the shipped sample
 ```
 
