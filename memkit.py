@@ -321,9 +321,22 @@ def link_issues(
                     continue
                 basename = target if target.endswith(".md") else f"{target}.md"
                 key = f"{relative(workspace, source)}->[[{target}]]"
-                exists = bool(named.get(basename) or slugged.get(memory_slug(target)))
-                if not exists and key not in allowed:
+                candidates = {
+                    path.resolve()
+                    for path in (
+                        list(named.get(basename, []))
+                        + list(slugged.get(memory_slug(target), []))
+                    )
+                }
+                if not candidates and key not in allowed:
                     issues.append(f"broken wiki link: {key}")
+                elif len(candidates) > 1:
+                    listing = ", ".join(
+                        sorted(relative(workspace, path) for path in candidates)
+                    )
+                    issues.append(
+                        f"ambiguous wiki link ({len(candidates)} matches): {key} -> {listing}"
+                    )
     return issues
 
 
@@ -340,46 +353,58 @@ def orphan_issues(workspace: Path, spec: Dict[str, Any]) -> List[str]:
         if missing:
             issues.extend(f"index missing: {path}" for path in missing)
             continue
-        indexed_names: Set[str] = set()
+        indexed_paths: Set[str] = set()
         for index_path in index_paths:
             text = index_path.read_text(encoding="utf-8", errors="replace")
             for raw_target in MARKDOWN_LINK_RE.findall(text):
                 target = raw_target.strip().strip("<>").split("#", 1)[0]
                 target = target.split(maxsplit=1)[0]
-                if target.lower().endswith(".md"):
-                    indexed_names.add(Path(target).name)
-        index_names = {path.name for path in index_paths}
-        allowed = set(root_item.get("orphan_allowlist", []))
+                if not target.lower().endswith(".md") or "://" in target:
+                    continue
+                resolved = Path(os.path.abspath(index_path.parent / target))
+                try:
+                    indexed_paths.add(resolved.relative_to(root.resolve()).as_posix())
+                except ValueError:
+                    continue  # index may legitimately link outside this root
+        index_rels = {
+            Path(os.path.abspath(path)).relative_to(root.resolve()).as_posix()
+            for path in index_paths
+        }
+        allowed = {
+            Path(entry).as_posix() for entry in root_item.get("orphan_allowlist", [])
+        }
         for path in memory_files(root, archive):
-            if path.name in index_names or path.name in allowed:
+            rel_to_root = path.resolve().relative_to(root.resolve()).as_posix()
+            if rel_to_root in index_rels or rel_to_root in allowed:
                 continue
-            if path.name not in indexed_names:
+            if rel_to_root not in indexed_paths:
                 issues.append(f"orphan memory: {relative(workspace, path)}")
     return issues
 
 
 def duplicate_issues(workspace: Path, spec: Dict[str, Any]) -> List[str]:
+    """Exact-content duplicates, pooled across every opted-in memory root."""
     issues: List[str] = []
     archive = archive_dir_name(spec)
     allowed_groups = {
         tuple(sorted(group)) for group in spec.get("allowed_exact_duplicates", [])
     }
+    by_hash: Dict[str, List[str]] = defaultdict(list)
     for root_item in spec["memory_roots"]:
         if not root_item.get("check_exact_duplicates", False):
             continue
         root = workspace_path(workspace, root_item["path"])
-        by_hash: Dict[str, List[str]] = defaultdict(list)
         index_names = set(root_item.get("indexes", []))
         for path in memory_files(root, archive):
             if path.name in index_names:
                 continue
             by_hash[sha256_path(path)].append(relative(workspace, path))
-        for paths in by_hash.values():
-            if len(paths) < 2:
-                continue
-            group = tuple(sorted(paths))
-            if group not in allowed_groups:
-                issues.append(f"exact duplicate memories: {', '.join(group)}")
+    for paths in by_hash.values():
+        if len(paths) < 2:
+            continue
+        group = tuple(sorted(paths))
+        if group not in allowed_groups:
+            issues.append(f"exact duplicate memories: {', '.join(group)}")
     return issues
 
 
@@ -396,7 +421,7 @@ def structural_issues(
 
 
 # --------------------------------------------------------------------------
-# Symlink wiring (dry-run, timestamped backup, idempotent)
+# Symlink wiring: preflight (validate everything) -> execute (with rollback)
 # --------------------------------------------------------------------------
 
 def expand_target(raw: str, workspace: Optional[Path] = None) -> Path:
@@ -404,7 +429,127 @@ def expand_target(raw: str, workspace: Optional[Path] = None) -> Path:
     path = Path(os.path.expanduser(raw))
     if not path.is_absolute() and workspace is not None:
         path = workspace / path
-    return path
+    return Path(os.path.abspath(path))
+
+
+def _is_same_or_ancestor(candidate: Path, of: Path) -> bool:
+    """True when ``candidate`` equals ``of`` or is one of its ancestors."""
+    c = candidate.as_posix().rstrip("/") + "/"
+    o = of.as_posix().rstrip("/") + "/"
+    return o.startswith(c)
+
+
+def _overlapping(a: Path, b: Path) -> bool:
+    return _is_same_or_ancestor(a, b) or _is_same_or_ancestor(b, a)
+
+
+def backup_name_for(target: Path) -> str:
+    """Unique, collision-free backup name derived from the full target path."""
+    return target.as_posix().lstrip("/").replace("/", "__") or "root"
+
+
+def preflight_links(
+    workspace: Path, spec: Dict[str, Any], backups: Path
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Validate every link entry before anything is written.
+
+    Returns (plan, issues). The plan is only executable when issues == [].
+    """
+    plan: List[Dict[str, Any]] = []
+    issues: List[str] = []
+    protected = [Path("/"), Path.home().resolve(), workspace.resolve()]
+    seen_targets: Set[str] = set()
+    accepted_targets: List[Path] = []
+
+    for index, entry in enumerate(spec.get("links", [])):
+        label = f"links[{index}]"
+        try:
+            source = workspace_path(workspace, entry["source"])
+        except (KeyError, TypeError, ValueError) as exc:
+            issues.append(f"{label}: invalid source ({exc})")
+            continue
+        if not source.exists():
+            issues.append(f"{label}: link source missing: {entry['source']}")
+            continue
+        try:
+            target = expand_target(entry["target"], workspace)
+        except (KeyError, TypeError) as exc:
+            issues.append(f"{label}: invalid target ({exc})")
+            continue
+        # Normalise the parent (follows directory symlinks such as macOS
+        # /var -> /private/var) while never following the leaf itself, so
+        # an existing wrong symlink is still seen as a symlink.
+        target = target.parent.resolve() / target.name
+
+        for danger in protected:
+            if _is_same_or_ancestor(target, danger):
+                issues.append(
+                    f"{label}: refusing dangerous target {target} "
+                    f"(equals or contains {danger})"
+                )
+                break
+        else:
+            source_abs = source.resolve()
+            if target == source_abs or _overlapping(target, source_abs):
+                issues.append(f"{label}: target overlaps its own source: {target}")
+            elif str(target) in seen_targets:
+                issues.append(f"{label}: duplicate target: {target}")
+            else:
+                for previous in accepted_targets:
+                    if _overlapping(target, previous):
+                        issues.append(
+                            f"{label}: target overlaps another target: "
+                            f"{target} <-> {previous}"
+                        )
+                        break
+                else:
+                    action, detail = "link_new", ""
+                    if target.is_symlink():
+                        current = Path(os.readlink(target))
+                        resolved = (
+                            (target.parent / current).resolve()
+                            if not current.is_absolute() else current.resolve()
+                        )
+                        if resolved == source.resolve():
+                            action = "noop"
+                        else:
+                            action, detail = "relink", str(resolved)
+                    elif target.exists():
+                        action = "backup_link"
+                        backup_dest = backups / backup_name_for(target)
+                        if backup_dest.exists():
+                            issues.append(f"{label}: backup collision: {backup_dest}")
+                            continue
+                        detail = str(backup_dest)
+                    seen_targets.add(str(target))
+                    accepted_targets.append(target)
+                    plan.append(
+                        {"action": action, "source": source, "target": target,
+                         "detail": detail, "label": label}
+                    )
+    return plan, issues
+
+
+def _write_ledger(backups: Path, moved: List[Tuple[Path, Path]]) -> None:
+    ledger = [
+        {"original": str(original), "backup": str(backup)}
+        for original, backup in moved
+    ]
+    backups.mkdir(parents=True, exist_ok=True)
+    (backups / "restore_ledger.json").write_text(
+        json.dumps({"restore": ledger}, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _rollback(created: List[Path], moved: List[Tuple[Path, Path]], log: List[str]) -> None:
+    for link in reversed(created):
+        if link.is_symlink():
+            link.unlink()
+            log.append(f"ROLLBACK unlink: {link}")
+    for original, backup in reversed(moved):
+        if backup.exists() and not original.exists():
+            shutil.move(str(backup), str(original))
+            log.append(f"ROLLBACK restore: {backup} -> {original}")
 
 
 def apply_links(
@@ -414,44 +559,57 @@ def apply_links(
     backup_root: Optional[Path] = None,
     now: Optional[str] = None,
 ) -> Tuple[List[str], List[str]]:
-    """Wire spec["links"] targets to canonical sources. Returns (log, issues)."""
-    log: List[str] = []
-    issues: List[str] = []
+    """Two-phase link wiring: preflight everything, then execute with rollback."""
     entries = spec.get("links", [])
     if not entries:
-        return ["no links declared in spec"], issues
+        return ["no links declared in spec"], []
     stamp = now or datetime.now().strftime("%Y%m%d_%H%M%S")
     backups = (backup_root or expand_target(
         spec.get("link_backup_dir", "~/.memkit_backups"), workspace
     )) / stamp
 
-    for entry in entries:
-        source = workspace_path(workspace, entry["source"])
-        target = expand_target(entry["target"], workspace)
-        if not source.exists():
-            issues.append(f"link source missing: {entry['source']}")
-            continue
-        if target.is_symlink():
-            current = Path(os.readlink(target))
-            resolved = (target.parent / current).resolve() if not current.is_absolute() else current.resolve()
-            if resolved == source.resolve():
-                log.append(f"OK (already linked): {target} -> {source}")
+    plan, issues = preflight_links(workspace, spec, backups)
+    log = [f"PREFLIGHT: {len(plan)} ok / {len(issues)} rejected"]
+    if issues:
+        return log, issues
+
+    for item in plan:
+        prefix = "DRY " if dry_run else ""
+        if item["action"] == "noop":
+            log.append(f"OK (already linked): {item['target']} -> {item['source']}")
+        elif item["action"] == "relink":
+            log.append(f"{prefix}RELINK: {item['target']} (was -> {item['detail']})")
+        elif item["action"] == "backup_link":
+            log.append(f"{prefix}BACKUP: {item['target']} -> {item['detail']}")
+        if item["action"] != "noop":
+            log.append(f"{prefix}LINK: {item['target']} -> {item['source']}")
+    if dry_run:
+        return log, issues
+
+    created: List[Path] = []
+    moved: List[Tuple[Path, Path]] = []
+    try:
+        for item in plan:
+            target: Path = item["target"]
+            if item["action"] == "noop":
                 continue
-            log.append(f"RELINK: {target} (was -> {resolved})")
-            if not dry_run:
+            if item["action"] == "relink":
                 target.unlink()
-        elif target.exists():
-            backup_to = backups / target.name
-            log.append(f"BACKUP: {target} -> {backup_to}")
-            if not dry_run:
+            elif item["action"] == "backup_link":
+                backup_dest = Path(item["detail"])
                 backups.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(target), str(backup_to))
-        else:
-            log.append(f"NEW: {target}")
-        if not dry_run:
+                shutil.move(str(target), str(backup_dest))
+                moved.append((target, backup_dest))
+                _write_ledger(backups, moved)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.symlink_to(source)
-        log.append(f"{'DRY ' if dry_run else ''}LINK: {target} -> {source}")
+            target.symlink_to(item["source"])
+            created.append(target)
+    except OSError as exc:
+        _rollback(created, moved, log)
+        issues.append(f"link execution failed and was rolled back: {exc}")
+        return log, issues
+    if moved:
+        _write_ledger(backups, moved)
     return log, issues
 
 
@@ -485,10 +643,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     spec_path = (args.spec or workspace / "memory_spec.json").resolve()
     try:
         spec = load_spec(spec_path)
-        manifest_path = (
-            args.manifest
-            or workspace_path(workspace, spec.get("manifest_path", "memory_manifest.generated.json"))
-        )
+        if args.manifest is not None:
+            manifest_path = Path(os.path.abspath(args.manifest))
+            try:
+                manifest_path.relative_to(workspace)
+            except ValueError:
+                raise ValueError(
+                    f"--manifest must stay inside the workspace: {manifest_path}"
+                ) from None
+        else:
+            manifest_path = workspace_path(
+                workspace, spec.get("manifest_path", "memory_manifest.generated.json")
+            )
         expected = generate_manifest(workspace, spec)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"MEMKIT_CHECK=FAIL\n- {exc}", file=sys.stderr)

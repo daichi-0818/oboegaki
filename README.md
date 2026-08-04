@@ -4,8 +4,8 @@
 Markdown + Git + symlinks. No database, no embeddings, no LLM calls, no
 daemon, no API keys. One stdlib-only Python file.
 
-[![tests](https://img.shields.io/badge/tests-26%20passing-brightgreen)](tests/)
-[![zero-api](https://img.shields.io/badge/network%20calls-0%20(proven%20by%20test)-blue)](tests/test_zero_api.py)
+[![tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)](tests/)
+[![zero-api](https://img.shields.io/badge/network%20calls-0%20(test--enforced)-blue)](tests/test_zero_api.py)
 
 ## Why
 
@@ -66,7 +66,7 @@ python3 memkit.py check   --workspace my-workspace
 |---|---|
 | `memkit.py check` | Verifies manifest freshness (SHA-256), typed relations, Markdown/wiki links, orphans (files missing from every index), and exact-content duplicates. Exit 0 = PASS. |
 | `memkit.py refresh` | Deterministically regenerates the manifest from the human-authored spec. Atomic write; safe to run repeatedly. |
-| `memkit.py link [--dry-run]` | Wires live directories to their canonical location via symlinks. Dry-run first; existing real directories are moved to a timestamped backup, never deleted; re-runs are no-ops. |
+| `memkit.py link [--dry-run]` | Wires live directories to their canonical location via symlinks in two phases: **preflight** validates every entry (dangerous targets such as `/`, `$HOME`, the workspace root, source/target overlaps, nested or duplicate targets, and backup collisions are all rejected before anything is written — one bad entry blocks all writes), then **execute** with automatic rollback on mid-failure. Existing real directories are moved to a per-path-unique timestamped backup with a `restore_ledger.json`; re-runs are no-ops. |
 
 ## Typed relations
 
@@ -89,16 +89,23 @@ is fully reproducible. Automation and judgment never share a file.
 ## Safety design
 
 - **Dry-run everything**: `link --dry-run` prints the exact plan.
-- **Timestamped backups**: a real directory at a link target is moved to a
-  backup folder, never removed. Wrong symlinks are retargeted (a symlink
-  holds no data); real data is only ever moved, never deleted.
+- **Preflight before write**: every link entry is validated first; any
+  rejection (dangerous target, overlap, duplicate, backup collision)
+  blocks the whole run before a single write happens.
+- **Timestamped backups + restore ledger**: a real directory at a link
+  target is moved to a backup folder named after its full path (collision
+  free), never removed, and recorded in `restore_ledger.json`. Wrong
+  symlinks are retargeted (a symlink holds no data); real data is only
+  ever moved, never deleted. Mid-failure triggers automatic rollback.
 - **Idempotent**: re-running `link` on a wired workspace changes nothing.
 - **Path containment**: spec paths may not escape the workspace.
 - **CRLF-stable hashing**: line endings are normalised before hashing, so
   a repo shared between macOS/Linux/WSL doesn't produce false staleness.
-- **Zero API, proven**: [`tests/test_zero_api.py`](tests/test_zero_api.py)
-  statically forbids network/subprocess imports *and* runs the full CLI
-  with `socket` replaced by a bomb.
+- **Zero API, test-enforced**: [`tests/test_zero_api.py`](tests/test_zero_api.py)
+  whitelists stdlib imports, forbids process/dynamic-import escape hatches
+  (`os.system`, `os.exec*`, `eval`, `__import__`, …), *and* runs the full
+  CLI with `socket` replaced by a bomb. Tests are strong evidence, not a
+  formal proof.
 - **Calibrated checks**: every check dimension has a fault-injection test
   — healthy PASS, injected defect FAIL, byte-identical restore. A checker
   that has never failed on a known defect is not a checker.

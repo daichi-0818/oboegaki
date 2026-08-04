@@ -198,7 +198,10 @@ class SymlinkTest(unittest.TestCase):
             log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
             self.assertEqual(issues, [])
             self.assertTrue(live.is_symlink())
-            backup = root / "backups" / "t1" / "memory" / "keep_me.md"
+            ledger = json.loads(
+                (root / "backups" / "t1" / "restore_ledger.json").read_text()
+            )
+            backup = Path(ledger["restore"][0]["backup"]) / "keep_me.md"
             self.assertEqual(backup.read_text(encoding="utf-8"), "precious\n")
 
             log2, issues2 = memkit.apply_links(root, spec, dry_run=False, now="t2")
@@ -221,6 +224,184 @@ class SymlinkTest(unittest.TestCase):
             self.assertTrue(any("RELINK" in line for line in log))
 
 
+class PreflightTest(unittest.TestCase):
+    """Every dangerous link configuration must be rejected before any write."""
+
+    def _run_link(self, root: Path, links: list) -> tuple:
+        spec = make_min_workspace(root)
+        spec["links"] = links
+        spec["link_backup_dir"] = "backups"
+        (root / "memory_spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        return memkit.apply_links(root, spec, dry_run=False, now="t1")
+
+    def _assert_rejected(self, root: Path, links: list, message: str) -> None:
+        log, issues = self._run_link(root, links)
+        self.assertTrue(any(message in i for i in issues), f"{message} not raised: {issues}")
+        self.assertFalse((root / "backups").exists(), "preflight must not write anything")
+
+    def test_rejects_workspace_root_and_filesystem_root_and_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._assert_rejected(root, [{"source": "memory", "target": str(root)}],
+                                  "dangerous target")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._assert_rejected(root, [{"source": "memory", "target": "/"}],
+                                  "dangerous target")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._assert_rejected(root, [{"source": "memory", "target": str(Path.home())}],
+                                  "dangerous target")
+
+    def test_rejects_source_target_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._assert_rejected(root, [{"source": "memory", "target": "memory/_archive"}],
+                                  "overlaps its own source")
+
+    def test_rejects_duplicate_and_nested_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._assert_rejected(
+                root,
+                [{"source": "memory", "target": "live/a"},
+                 {"source": "memory", "target": "live/a"}],
+                "duplicate target",
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._assert_rejected(
+                root,
+                [{"source": "memory", "target": "live/a"},
+                 {"source": "memory", "target": "live/a/nested"}],
+                "overlaps another target",
+            )
+
+    def test_rejects_backup_collision_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "live" / "memory").mkdir(parents=True)
+            normalized_target = (root / "live").resolve() / "memory"
+            collision = root / "backups" / "t1" / memkit.backup_name_for(normalized_target)
+            collision.mkdir(parents=True)
+            log, issues = self._run_link(
+                root, [{"source": "memory", "target": "live/memory"}]
+            )
+            self.assertTrue(any("backup collision" in i for i in issues))
+            self.assertFalse((root / "live" / "memory").is_symlink(),
+                             "nothing may be linked when preflight fails")
+
+    def test_one_bad_entry_blocks_all_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, issues = self._run_link(
+                root,
+                [{"source": "memory", "target": "live/good"},
+                 {"source": "memory", "target": "/"}],
+            )
+            self.assertTrue(issues)
+            self.assertFalse((root / "live").exists(),
+                             "valid entries must not run when any entry is rejected")
+
+
+class RollbackLedgerTest(unittest.TestCase):
+    def test_mid_failure_rolls_back_links_and_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            spec["links"] = [
+                {"source": "memory", "target": "live/a"},
+                {"source": "memory", "target": "live/b"},
+            ]
+            spec["link_backup_dir"] = "backups"
+            live_b = root / "live" / "b"
+            live_b.mkdir(parents=True)
+            (live_b / "precious.md").write_text("keep\n", encoding="utf-8")
+
+            original_symlink_to = Path.symlink_to
+            calls = {"n": 0}
+
+            def failing_symlink_to(self_path, target_path):  # noqa: ANN001
+                calls["n"] += 1
+                if calls["n"] >= 2:
+                    raise OSError("injected failure on second link")
+                return original_symlink_to(self_path, target_path)
+
+            Path.symlink_to = failing_symlink_to  # type: ignore[method-assign]
+            try:
+                log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            finally:
+                Path.symlink_to = original_symlink_to  # type: ignore[method-assign]
+
+            self.assertTrue(any("rolled back" in i for i in issues))
+            self.assertFalse((root / "live" / "a").is_symlink(), "created link must be removed")
+            self.assertTrue((live_b / "precious.md").is_file(), "backup must be restored")
+            self.assertFalse(live_b.is_symlink())
+
+    def test_restore_ledger_written_with_full_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            spec["links"] = [{"source": "memory", "target": "live/memory"}]
+            spec["link_backup_dir"] = "backups"
+            live = root / "live" / "memory"
+            live.mkdir(parents=True)
+            (live / "old.md").write_text("old\n", encoding="utf-8")
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertEqual(issues, [])
+            ledger = json.loads(
+                (root / "backups" / "t1" / "restore_ledger.json").read_text()
+            )
+            self.assertEqual(len(ledger["restore"]), 1)
+            entry = ledger["restore"][0]
+            self.assertTrue(entry["original"].endswith("live/memory"))
+            self.assertTrue(Path(entry["backup"]).is_dir())
+
+
+class NewCheckSemanticsTest(unittest.TestCase):
+    def test_ambiguous_wiki_link_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory = root / "memory"
+            memory.mkdir()
+            (memory / "project_src.md").write_text("See [[feedback-one-rule]].\n", encoding="utf-8")
+            (memory / "feedback_one_rule.md").write_text("# a\n", encoding="utf-8")
+            (memory / "feedback-one-rule.md").write_text("# b\n", encoding="utf-8")
+            spec = {"memory_roots": [{"id": "c", "path": "memory"}]}
+            named = memkit.all_named_memories(root, spec["memory_roots"])
+            issues = memkit.link_issues(root, spec, named)
+            self.assertTrue(any("ambiguous wiki link" in i for i in issues), issues)
+
+    def test_orphan_uses_paths_not_basenames(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            shadow = root / "memory" / "_archive" / "project_fact.md"
+            shadow.write_text("# same basename, different file\n", encoding="utf-8")
+            issues = memkit.orphan_issues(root, spec)
+            self.assertTrue(
+                any("_archive/project_fact.md" in i for i in issues),
+                f"basename shadowing must not hide orphans: {issues}",
+            )
+
+    def test_cross_root_exact_duplicates_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            other = root / "silo"
+            other.mkdir()
+            (other / "project_copy.md").write_text("# fact\n", encoding="utf-8")
+            spec["memory_roots"].append(
+                {"id": "silo", "path": "silo", "check_exact_duplicates": True}
+            )
+            issues = memkit.duplicate_issues(root, spec)
+            self.assertTrue(
+                any("memory/project_fact.md" in i and "silo/project_copy.md" in i
+                    for i in issues),
+                issues,
+            )
+
+
 class CliTest(unittest.TestCase):
     def test_check_requires_refresh_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,6 +413,19 @@ class CliTest(unittest.TestCase):
             code, out, err = run_cli(["refresh", "--workspace", str(root)])
             self.assertEqual(code, 0)
             self.assertIn("MEMKIT_CHECK=PASS", out)
+
+    def test_manifest_outside_workspace_fails_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "ws"
+            root.mkdir()
+            make_min_workspace(root)
+            outside = Path(tmp) / "evil_manifest.json"
+            code, out, err = run_cli(
+                ["refresh", "--workspace", str(root), "--manifest", str(outside)]
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("must stay inside the workspace", err)
+            self.assertFalse(outside.exists(), "no file may be written outside the workspace")
 
 
 if __name__ == "__main__":

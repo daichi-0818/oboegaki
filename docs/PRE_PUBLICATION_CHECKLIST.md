@@ -5,8 +5,11 @@ explicit human go — a public push is cache-permanent even if deleted.
 
 ## Content audit
 - [ ] `git ls-files` contains no caches/venv/binaries (`.gitignore` hardened)
-- [ ] Secret scan over tracked files, **full git history**, untracked and
-      ignored files, and build artifacts (`git log -p` grep or gitleaks)
+- [ ] **Run a dedicated secret scanner (gitleaks or equivalent) immediately
+      before publication** over the working tree AND full git history —
+      pattern greps during development do not replace this step
+- [ ] Secret grep over tracked files, untracked and ignored files, and
+      build artifacts (belt-and-suspenders alongside the scanner)
 - [ ] Binaries (if any ever appear) inspected with `strings`
 - [ ] No real personal names, emails, employers, hostnames, usernames, or
       absolute private paths anywhere (grep for your own identifiers)

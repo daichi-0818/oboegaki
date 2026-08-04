@@ -184,6 +184,75 @@ class FaultInjectionTest(unittest.TestCase):
 
         self.assert_calibrated(mutate, restore, "unresolved contradiction")
 
+    def test_detects_ambiguous_wiki_link(self) -> None:
+        rival = self.ws / "memory" / "_archive" / "feedback-never-leave-oven-unattended.md"
+        index = self.ws / "memory" / "MEMORY.md"
+        original_index = index.read_bytes()
+
+        def mutate() -> None:
+            rival.write_text("# rival file claiming the same logical ID\n", encoding="utf-8")
+            index.write_bytes(
+                original_index
+                + b"- [rival](_archive/feedback-never-leave-oven-unattended.md)\n"
+            )
+
+        def restore() -> None:
+            rival.unlink()
+            index.write_bytes(original_index)
+
+        self.assert_calibrated(mutate, restore, "ambiguous wiki link")
+
+    def test_detects_basename_shadowed_orphan(self) -> None:
+        shadow = self.ws / "memory" / "_archive" / "project_oven_controller_v2.md"
+
+        def mutate() -> None:
+            shadow.write_text("# same basename as an indexed file\n", encoding="utf-8")
+
+        def restore() -> None:
+            shadow.unlink()
+
+        self.assert_calibrated(mutate, restore, "orphan memory")
+
+    def test_link_rejects_injected_dangerous_target(self) -> None:
+        spec_path = self.ws / "memory_spec.json"
+        original = spec_path.read_bytes()
+        spec = json.loads(original)
+        spec["links"] = [{"source": "memory", "target": "."}]
+        spec_path.write_text(json.dumps(spec, indent=2))
+        code, output = run(["link", "--workspace", str(self.ws)])
+        self.assertEqual(code, 1)
+        self.assertIn("dangerous target", output)
+        spec_path.write_bytes(original)
+        code, output = run(["check", "--workspace", str(self.ws)])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(tree_hash(self.ws), self.baseline)
+
+    def test_link_rejects_injected_duplicate_targets(self) -> None:
+        spec_path = self.ws / "memory_spec.json"
+        original = spec_path.read_bytes()
+        spec = json.loads(original)
+        spec["links"] = [
+            {"source": "memory", "target": "sandbox/live_memory"},
+            {"source": "memory", "target": "sandbox/live_memory"},
+        ]
+        spec_path.write_text(json.dumps(spec, indent=2))
+        code, output = run(["link", "--workspace", str(self.ws)])
+        self.assertEqual(code, 1)
+        self.assertIn("duplicate target", output)
+        self.assertFalse((self.ws / "sandbox").exists())
+        spec_path.write_bytes(original)
+        self.assertEqual(tree_hash(self.ws), self.baseline)
+
+    def test_manifest_escape_attempt_writes_nothing(self) -> None:
+        outside = self.ws.parent / "escaped_manifest.json"
+        code, output = run(
+            ["refresh", "--workspace", str(self.ws), "--manifest", str(outside)]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("must stay inside the workspace", output)
+        self.assertFalse(outside.exists())
+        self.assertEqual(tree_hash(self.ws), self.baseline)
+
     def test_detects_missing_context_source(self) -> None:
         victim = self.ws / "memory" / "reference_flour_supplier_api.md"
         original = victim.read_bytes()
