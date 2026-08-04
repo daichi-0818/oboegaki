@@ -5,7 +5,7 @@ Durable, verifiable, file-based long-term memory for AI agents and humans.
 Markdown + Git + symlinks. No database, no embeddings, no LLM calls, no
 daemon, no API keys. One stdlib-only Python file.
 
-[![tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)](tests/)
+[![ci](https://github.com/daichi-0818/oboegaki/actions/workflows/ci.yml/badge.svg)](https://github.com/daichi-0818/oboegaki/actions/workflows/ci.yml)
 [![zero-api](https://img.shields.io/badge/network%20calls-0%20(test--enforced)-blue)](tests/test_zero_api.py)
 
 ## Why
@@ -53,13 +53,29 @@ echo "edited without re-approval" >> /tmp/demo/memory/feedback_scale_recipes_by_
 python3 memkit.py check --workspace /tmp/demo        # FAIL: manifest is stale
 ```
 
-Set up your own workspace:
+Set up your own workspace (copy-paste runnable):
 
 ```bash
-cp spec.template.json my-workspace/memory_spec.json  # edit paths
+mkdir -p my-workspace/memory
+cp spec.template.json my-workspace/memory_spec.json
+cat > my-workspace/memory/MEMORY.md <<'MD'
+# Index
+- [ctx](ctx_example.md)
+- [fact](project_example.md)
+MD
+cat > my-workspace/memory/ctx_example.md <<'MD'
+# Example context (L2)
+See [fact](project_example.md).
+MD
+cat > my-workspace/memory/project_example.md <<'MD'
+# Example fact (L1)
+MD
 python3 memkit.py refresh --workspace my-workspace   # generate the manifest
-python3 memkit.py check   --workspace my-workspace
+python3 memkit.py check   --workspace my-workspace   # MEMKIT_CHECK=PASS
 ```
+
+Then edit `memory_spec.json` to declare your real roots, contexts, and
+relationships as they grow.
 
 ## CLI
 
