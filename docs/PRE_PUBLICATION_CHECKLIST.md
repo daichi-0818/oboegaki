@@ -26,7 +26,9 @@ explicit human go — a public push is cache-permanent even if deleted.
 - [ ] `python3 -m unittest discover -s tests -v` — all green
 - [ ] Zero-API tests pass (static + dynamic)
 - [ ] Fault-injection suite passes (every check dimension calibrated)
-- [ ] README quickstart commands re-executed verbatim on a fresh clone
+- [ ] README quickstart commands re-executed **verbatim from a fresh
+      clone of the published URL** (the pre-publication audit can only
+      cover local steps)
 
 ## Publication (human-gated)
 - [ ] Final human approval obtained immediately before `--public`

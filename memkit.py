@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import sys
+import unicodedata
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -444,13 +445,31 @@ def _overlapping(a: Path, b: Path) -> bool:
 
 
 def backup_name_for(target: Path) -> str:
-    """Collision-free backup name: SHA-256 of the absolute path + basename.
+    """Collision-resistant backup name: SHA-256 of the absolute path + basename.
 
     A separator-substitution scheme ("/" -> "__") would collide for
-    ``/a/b__c`` vs ``/a/b/c``; hashing the full path cannot.
+    ``/a/b__c`` vs ``/a/b/c``; a truncated hash makes that practically
+    impossible, and preflight additionally detects any collision among
+    existing and planned backup destinations before anything is written.
     """
     digest = hashlib.sha256(target.as_posix().encode("utf-8")).hexdigest()[:16]
     return f"{digest}__{target.name or 'root'}"
+
+
+def portable_key(path: Path) -> str:
+    """Filesystem-portable identity key for not-yet-created paths.
+
+    NFC-normalised and casefolded, so ``CaseLink`` and ``caselink`` (or NFD
+    vs NFC spellings) are treated as the same future path. This is stricter
+    than a case-sensitive filesystem requires, by design: link layouts that
+    only work on some filesystems are rejected everywhere.
+    """
+    return unicodedata.normalize("NFC", path.as_posix()).casefold()
+
+
+def _keys_overlap(a: str, b: str) -> bool:
+    a_s, b_s = a.rstrip("/") + "/", b.rstrip("/") + "/"
+    return a_s.startswith(b_s) or b_s.startswith(a_s)
 
 
 def _samefile(a: Path, b: Path) -> bool:
@@ -471,11 +490,10 @@ def preflight_links(
     plan: List[Dict[str, Any]] = []
     issues: List[str] = []
     protected = [Path("/"), Path.home().resolve(), workspace.resolve()]
-    seen_targets: Set[str] = set()
-    accepted_targets: List[Path] = []
-    planned_backups: Set[str] = set()
     backups_norm = backups.resolve()
 
+    # ---- Phase A: collect and normalise every entry first ----------------
+    parsed: List[Dict[str, Any]] = []
     for index, entry in enumerate(spec.get("links", [])):
         label = f"links[{index}]"
         try:
@@ -495,11 +513,35 @@ def preflight_links(
         # /var -> /private/var) while never following the leaf itself, so
         # an existing wrong symlink is still seen as a symlink.
         target = target.parent.resolve() / target.name
+        parsed.append(
+            {
+                "label": label,
+                "source": source,
+                "source_abs": source.resolve(),
+                "target": target,
+                "target_key": portable_key(target),
+                "target_is_symlink": target.is_symlink(),
+            }
+        )
 
+    all_sources = [(item["label"], item["source_abs"]) for item in parsed]
+
+    # ---- Phase B: cross-entry validation, then per-entry classification --
+    seen_target_keys: Set[str] = set()
+    accepted: List[Dict[str, Any]] = []
+    planned_backups: Set[str] = set()
+
+    for item in parsed:
+        label = item["label"]
+        source: Path = item["source"]
+        source_abs: Path = item["source_abs"]
+        target: Path = item["target"]
+        target_key: str = item["target_key"]
         # samefile checks are for REAL files/dirs only: a symlink target is
         # judged by the noop/relink logic (replacing a symlink loses no data),
         # and samefile would follow it and misfire on the already-linked case.
-        target_is_symlink = target.is_symlink()
+        target_is_symlink: bool = item["target_is_symlink"]
+
         rejected = False
         for danger in protected:
             if _is_same_or_ancestor(target, danger) or (
@@ -514,33 +556,51 @@ def preflight_links(
         if rejected:
             continue
 
-        source_abs = source.resolve()
-        if target == source_abs or _overlapping(target, source_abs):
-            issues.append(f"{label}: target overlaps its own source: {target}")
+        # Every target is checked against EVERY source, not only its own:
+        # replacing a directory that contains (or is) another entry's source
+        # would corrupt that entry mid-run.
+        for other_label, other_source in all_sources:
+            if (
+                _overlapping(target, other_source)
+                or _keys_overlap(target_key, portable_key(other_source))
+                or (not target_is_symlink and _samefile(target, other_source))
+            ):
+                suffix = "its own source" if other_label == label else f"the source of {other_label}"
+                issues.append(
+                    f"{label}: target overlaps or aliases {suffix}: "
+                    f"{target} <-> {other_source}"
+                )
+                rejected = True
+                break
+        if rejected:
             continue
-        if not target_is_symlink and _samefile(target, source):
-            issues.append(
-                f"{label}: target aliases its own source (samefile, e.g. a "
-                f"case-insensitive filesystem): {target}"
-            )
-            continue
+
         if _overlapping(backups_norm, target) or _overlapping(backups_norm, source_abs):
             issues.append(
                 f"{label}: backup directory overlaps a link source/target: "
                 f"{backups_norm} <-> {target}"
             )
             continue
-        if str(target) in seen_targets:
-            issues.append(f"{label}: duplicate target: {target}")
+        if target_key in seen_target_keys:
+            issues.append(
+                f"{label}: duplicate target (portable identity, case/NFC "
+                f"insensitive): {target}"
+            )
             continue
         overlap = next(
-            (previous for previous in accepted_targets
-             if _overlapping(target, previous) or _samefile(target, previous)),
+            (
+                previous
+                for previous in accepted
+                if _keys_overlap(target_key, previous["target_key"])
+                or _overlapping(target, previous["target"])
+                or _samefile(target, previous["target"])
+            ),
             None,
         )
         if overlap is not None:
             issues.append(
-                f"{label}: target overlaps another target: {target} <-> {overlap}"
+                f"{label}: target overlaps another target: "
+                f"{target} <-> {overlap['target']}"
             )
             continue
 
@@ -550,7 +610,8 @@ def preflight_links(
             current = Path(raw_link)
             resolved = (
                 (target.parent / current).resolve()
-                if not current.is_absolute() else current.resolve()
+                if not current.is_absolute()
+                else current.resolve()
             )
             if resolved == source.resolve():
                 action = "noop"
@@ -563,12 +624,14 @@ def preflight_links(
                 issues.append(f"{label}: backup collision: {backup_dest}")
                 continue
             if str(backup_dest) in planned_backups:
-                issues.append(f"{label}: planned backup destination collides: {backup_dest}")
+                issues.append(
+                    f"{label}: planned backup destination collides: {backup_dest}"
+                )
                 continue
             planned_backups.add(str(backup_dest))
             detail = str(backup_dest)
-        seen_targets.add(str(target))
-        accepted_targets.append(target)
+        seen_target_keys.add(target_key)
+        accepted.append({"target": target, "target_key": target_key})
         plan.append(
             {"action": action, "source": source, "target": target,
              "detail": detail, "label": label}

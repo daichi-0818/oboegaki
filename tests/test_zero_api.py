@@ -77,6 +77,7 @@ class StaticScanTest(unittest.TestCase):
         allowed = {
             "__future__", "argparse", "collections", "datetime", "hashlib",
             "json", "os", "pathlib", "re", "shutil", "sys", "typing",
+            "unicodedata",
         }
         tree = ast.parse((ROOT / "memkit.py").read_text(encoding="utf-8"))
         imported = set()

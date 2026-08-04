@@ -4,7 +4,7 @@
 Markdown + Git + symlinks. No database, no embeddings, no LLM calls, no
 daemon, no API keys. One stdlib-only Python file.
 
-[![tests](https://img.shields.io/badge/tests-51%20passing-brightgreen)](tests/)
+[![tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)](tests/)
 [![zero-api](https://img.shields.io/badge/network%20calls-0%20(test--enforced)-blue)](tests/test_zero_api.py)
 
 ## Why
@@ -91,12 +91,15 @@ is fully reproducible. Automation and judgment never share a file.
 - **Dry-run everything**: `link --dry-run` prints the exact plan.
 - **Preflight before write**: every link entry is validated first; any
   rejection (dangerous target incl. case-insensitive aliases via
-  `samefile`, source/target overlap, nested or duplicate targets, backup
-  directory overlapping a source/target, planned-backup collisions)
-  blocks the whole run before a single write happens.
+  `samefile`; every target checked against **every** entry's source for
+  ancestor/descendant/samefile conflicts; nested or duplicate targets —
+  including not-yet-created paths compared by an NFC+casefold portable
+  key; backup directory overlapping a source/target; planned-backup
+  collisions) blocks the whole run before a single write happens.
 - **Timestamped backups + restore ledger + transaction journal**: a real
   directory at a link target is moved to a backup folder named by the
-  SHA-256 of its absolute path (collision free by construction), never
+  SHA-256 of its absolute path (collision-resistant, plus preflight
+  collision detection over existing and planned backups), never
   removed, and recorded in `restore_ledger.json`. Every mutation —
   moves, replaced symlinks (with their original link text), created
   parent directories, created links — is journalled to

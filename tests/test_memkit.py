@@ -258,7 +258,7 @@ class PreflightTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._assert_rejected(root, [{"source": "memory", "target": "memory/_archive"}],
-                                  "overlaps its own source")
+                                  "its own source")
 
     def test_rejects_duplicate_and_nested_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -537,6 +537,74 @@ class TransactionSafetyTest(unittest.TestCase):
             self.assertTrue(any("rolled back" in i for i in issues))
             self.assertFalse((root / "deep").exists(),
                              "created parent directories must be removed")
+
+    def test_cross_entry_target_equal_to_other_source_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            src_b = root / "srcB"
+            src_b.mkdir()
+            (src_b / "x.md").write_text("x\n", encoding="utf-8")
+            spec["links"] = [
+                {"source": "memory", "target": "srcB"},
+                {"source": "srcB", "target": "live/b"},
+            ]
+            spec["link_backup_dir"] = "backups"
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertTrue(any("the source of links[1]" in i for i in issues), issues)
+            self.assertFalse(src_b.is_symlink(), "other entry's source must stay intact")
+            self.assertFalse((root / "live").exists())
+
+    def test_cross_entry_target_ancestor_of_other_source_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            deep_src = root / "pool" / "srcB"
+            deep_src.mkdir(parents=True)
+            (deep_src / "x.md").write_text("x\n", encoding="utf-8")
+            spec["links"] = [
+                {"source": "memory", "target": "pool"},
+                {"source": "pool/srcB", "target": "live/b"},
+            ]
+            spec["link_backup_dir"] = "backups"
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertTrue(any("the source of links[1]" in i for i in issues), issues)
+            self.assertFalse((root / "pool").is_symlink())
+
+    def test_cross_entry_target_descendant_of_other_source_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            src_b = root / "srcB"
+            src_b.mkdir()
+            (src_b / "x.md").write_text("x\n", encoding="utf-8")
+            spec["links"] = [
+                {"source": "memory", "target": "srcB/inner"},
+                {"source": "srcB", "target": "live/b"},
+            ]
+            spec["link_backup_dir"] = "backups"
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertTrue(any("the source of links[1]" in i for i in issues), issues)
+            self.assertFalse((src_b / "inner").exists())
+
+    def test_portable_case_duplicate_targets_rejected_everywhere(self) -> None:
+        # Both targets do not exist yet, so samefile cannot help; the
+        # portable (NFC + casefold) key must reject the pair on every
+        # filesystem, case-sensitive or not.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            spec["links"] = [
+                {"source": "memory", "target": "live/CaseLink"},
+                {"source": "memory", "target": "live/caselink"},
+            ]
+            spec["link_backup_dir"] = "backups"
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertTrue(
+                any("duplicate target (portable identity" in i for i in issues), issues
+            )
+            self.assertFalse((root / "live").exists(),
+                             "one rejection must block all writes")
 
     def test_transaction_journal_records_relink_and_moves(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
