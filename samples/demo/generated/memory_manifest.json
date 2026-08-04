@@ -1,0 +1,101 @@
+{
+  "contexts": [
+    {
+      "id": "bakery-ops",
+      "path": "memory/ctx_bakery_ops.md",
+      "sha256": "ab70151ce6fb9502b45729caa7161d4cb16bc41f43c130eb72aa4263082ac52b",
+      "sources": [
+        {
+          "path": "memory/_archive/project_oven_controller_v1.md",
+          "role": "superseded",
+          "sha256": "c70005ba9a01e12d71d1d839896f2514c7da7a2a7bfd59e070ce80b48656583f"
+        },
+        {
+          "path": "memory/feedback_never_leave_oven_unattended.md",
+          "role": "rule",
+          "sha256": "e833a77a8f04f0fbd212f3a734a63d36d92eba6b1af04bbe45f6981695f3b8e8"
+        },
+        {
+          "path": "memory/feedback_scale_recipes_by_weight.md",
+          "role": "rule",
+          "sha256": "7fd71b81b51e00fd90c3f85811d55f2deb691e4b544e3db198443fecd01119b4"
+        },
+        {
+          "path": "memory/project_oven_controller_v2.md",
+          "role": "current_state",
+          "sha256": "47b982b4c1fe17551ec2694a541414792034fc5e9b3898da34e413de058d4f4e"
+        },
+        {
+          "path": "memory/reference_flour_supplier_api.md",
+          "role": "reference",
+          "sha256": "8d0fcef03142c3d15f149b759563c9d922bc0f8b45c5b9530db45fd03f7f009f"
+        }
+      ]
+    }
+  ],
+  "do_not_edit": "Run: python3 memkit.py refresh",
+  "generated": true,
+  "relations": [
+    {
+      "from": "memory/ctx_bakery_ops.md",
+      "origin": "generated_from_context_sources",
+      "scope": "superseded",
+      "to": "memory/_archive/project_oven_controller_v1.md",
+      "type": "derived_from"
+    },
+    {
+      "from": "memory/ctx_bakery_ops.md",
+      "origin": "generated_from_context_sources",
+      "scope": "rule",
+      "to": "memory/feedback_never_leave_oven_unattended.md",
+      "type": "derived_from"
+    },
+    {
+      "from": "memory/ctx_bakery_ops.md",
+      "origin": "generated_from_context_sources",
+      "scope": "rule",
+      "to": "memory/feedback_scale_recipes_by_weight.md",
+      "type": "derived_from"
+    },
+    {
+      "from": "memory/ctx_bakery_ops.md",
+      "origin": "generated_from_context_sources",
+      "scope": "current_state",
+      "to": "memory/project_oven_controller_v2.md",
+      "type": "derived_from"
+    },
+    {
+      "from": "memory/ctx_bakery_ops.md",
+      "origin": "generated_from_context_sources",
+      "scope": "reference",
+      "to": "memory/reference_flour_supplier_api.md",
+      "type": "derived_from"
+    },
+    {
+      "from": "memory/feedback_scale_recipes_by_weight.md",
+      "resolution": {
+        "decided": "2026-01-05",
+        "reason": "volume scaling drifted up to 20% between flour lots",
+        "status": "resolved",
+        "winner": "memory/feedback_scale_recipes_by_weight.md"
+      },
+      "scope": "recipe_scaling",
+      "to": "memory/_archive/feedback_recipe_scaling_by_volume.md",
+      "type": "contradicts"
+    },
+    {
+      "from": "memory/project_oven_controller_v2.md",
+      "scope": "controller_firmware",
+      "to": "memory/_archive/project_oven_controller_v1.md",
+      "type": "supersedes"
+    },
+    {
+      "from": "memory/project_sourdough_tracker.md",
+      "scope": "reorder_dates",
+      "to": "memory/reference_flour_supplier_api.md",
+      "type": "depends_on"
+    }
+  ],
+  "schema_version": 1,
+  "spec_sha256": "0e9cf8f544fa5f00316536d7adc99797f87f87785abb6cdef51c8981cb85fedc"
+}

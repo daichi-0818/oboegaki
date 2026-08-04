@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "manifest_path": "memory_manifest.generated.json",
+  "archive_dir": "_archive",
+  "wiki_link_prefixes": ["project", "reference", "feedback", "ctx"],
+  "memory_roots": [
+    {
+      "id": "central",
+      "path": "memory",
+      "indexes": ["MEMORY.md"],
+      "check_exact_duplicates": true,
+      "orphan_allowlist": []
+    }
+  ],
+  "contexts": [
+    {
+      "id": "example-domain",
+      "path": "memory/ctx_example.md",
+      "sources": [
+        {"path": "memory/project_example.md", "role": "current_state"}
+      ]
+    }
+  ],
+  "relationships": [],
+  "known_missing_link_exceptions": [],
+  "allowed_exact_duplicates": [],
+  "links": [],
+  "link_backup_dir": "~/.memkit_backups"
+}

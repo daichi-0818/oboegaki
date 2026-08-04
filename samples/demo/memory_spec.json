@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "manifest_path": "generated/memory_manifest.json",
+  "archive_dir": "_archive",
+  "wiki_link_prefixes": ["project", "reference", "feedback", "ctx"],
+  "memory_roots": [
+    {
+      "id": "central",
+      "path": "memory",
+      "indexes": ["MEMORY.md"],
+      "check_exact_duplicates": true,
+      "orphan_allowlist": []
+    }
+  ],
+  "contexts": [
+    {
+      "id": "bakery-ops",
+      "path": "memory/ctx_bakery_ops.md",
+      "sources": [
+        {"path": "memory/project_oven_controller_v2.md", "role": "current_state"},
+        {"path": "memory/feedback_never_leave_oven_unattended.md", "role": "rule"},
+        {"path": "memory/feedback_scale_recipes_by_weight.md", "role": "rule"},
+        {"path": "memory/reference_flour_supplier_api.md", "role": "reference"},
+        {"path": "memory/_archive/project_oven_controller_v1.md", "role": "superseded"}
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "from": "memory/project_oven_controller_v2.md",
+      "type": "supersedes",
+      "to": "memory/_archive/project_oven_controller_v1.md",
+      "scope": "controller_firmware"
+    },
+    {
+      "from": "memory/feedback_scale_recipes_by_weight.md",
+      "type": "contradicts",
+      "to": "memory/_archive/feedback_recipe_scaling_by_volume.md",
+      "scope": "recipe_scaling",
+      "resolution": {
+        "status": "resolved",
+        "winner": "memory/feedback_scale_recipes_by_weight.md",
+        "decided": "2026-01-05",
+        "reason": "volume scaling drifted up to 20% between flour lots"
+      }
+    },
+    {
+      "from": "memory/project_sourdough_tracker.md",
+      "type": "depends_on",
+      "to": "memory/reference_flour_supplier_api.md",
+      "scope": "reorder_dates"
+    }
+  ],
+  "known_missing_link_exceptions": [
+    {
+      "reference": "memory/_archive/project_bakery_website_launch.md->project_logo_design.md",
+      "reason": "logo notes were retired before this memory system existed; kept as historical mention"
+    }
+  ],
+  "allowed_exact_duplicates": [],
+  "links": [
+    {"source": "memory", "target": "sandbox/live_memory"}
+  ],
+  "link_backup_dir": "sandbox/backups"
+}

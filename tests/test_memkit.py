@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Unit tests for memkit (stdlib only)."""
+from __future__ import annotations
+
+import io
+import json
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import memkit  # noqa: E402
+
+
+def make_min_workspace(root: Path) -> dict:
+    memory = root / "memory"
+    (memory / "_archive").mkdir(parents=True)
+    (memory / "MEMORY.md").write_text(
+        "# Index\n- [ctx](ctx_demo.md)\n- [fact](project_fact.md)\n"
+        "- [old](_archive/project_old.md)\n",
+        encoding="utf-8",
+    )
+    (memory / "ctx_demo.md").write_text("# ctx\nSee [fact](project_fact.md).\n", encoding="utf-8")
+    (memory / "project_fact.md").write_text("# fact\n", encoding="utf-8")
+    (memory / "_archive" / "project_old.md").write_text("# old\n", encoding="utf-8")
+    spec = {
+        "schema_version": 1,
+        "manifest_path": "manifest.json",
+        "memory_roots": [
+            {
+                "id": "central",
+                "path": "memory",
+                "indexes": ["MEMORY.md"],
+                "check_exact_duplicates": True,
+            }
+        ],
+        "contexts": [
+            {
+                "id": "demo",
+                "path": "memory/ctx_demo.md",
+                "sources": [{"path": "memory/project_fact.md", "role": "evidence"}],
+            }
+        ],
+        "relationships": [],
+        "known_missing_link_exceptions": [],
+        "allowed_exact_duplicates": [],
+    }
+    (root / "memory_spec.json").write_text(json.dumps(spec), encoding="utf-8")
+    return spec
+
+
+def run_cli(argv: list) -> tuple:
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = memkit.main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+class ManifestTest(unittest.TestCase):
+    def test_deterministic_and_detects_source_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            first = memkit.generate_manifest(root, spec)
+            second = memkit.generate_manifest(root, spec)
+            self.assertEqual(first, second)
+            self.assertEqual(first["relations"][0]["type"], "derived_from")
+            (root / "memory" / "project_fact.md").write_text("# changed\n", encoding="utf-8")
+            changed = memkit.generate_manifest(root, spec)
+            self.assertNotEqual(
+                first["contexts"][0]["sources"][0]["sha256"],
+                changed["contexts"][0]["sources"][0]["sha256"],
+            )
+
+    def test_crlf_normalisation_keeps_hash_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = root / "a.md"
+            b = root / "b.md"
+            a.write_bytes(b"line1\nline2\n")
+            b.write_bytes(b"line1\r\nline2\r\n")
+            self.assertEqual(memkit.sha256_path(a), memkit.sha256_path(b))
+
+    def test_path_escape_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                memkit.workspace_path(Path(tmp), "../outside.md")
+
+
+class RelationTest(unittest.TestCase):
+    def _files(self, root: Path) -> None:
+        (root / "a.md").write_text("a\n", encoding="utf-8")
+        (root / "b.md").write_text("b\n", encoding="utf-8")
+
+    def test_unknown_type_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._files(root)
+            issues = memkit.relation_issues(root, [{"from": "a.md", "type": "related", "to": "b.md"}])
+            self.assertTrue(any("unknown relation type" in i for i in issues))
+
+    def test_unresolved_contradiction_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._files(root)
+            issues = memkit.relation_issues(
+                root, [{"from": "a.md", "type": "contradicts", "to": "b.md"}]
+            )
+            self.assertTrue(any("unresolved contradiction" in i for i in issues))
+
+    def test_contradiction_winner_must_be_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._files(root)
+            issues = memkit.relation_issues(
+                root,
+                [{
+                    "from": "a.md", "type": "contradicts", "to": "b.md",
+                    "resolution": {"status": "resolved", "winner": "c.md"},
+                }],
+            )
+            self.assertTrue(any("winner must be one endpoint" in i for i in issues))
+
+    def test_self_and_duplicate_relations_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._files(root)
+            rel = {"from": "a.md", "type": "depends_on", "to": "a.md"}
+            issues = memkit.relation_issues(root, [rel, dict(rel)])
+            self.assertTrue(any("self relation" in i for i in issues))
+            self.assertTrue(any("duplicate relation" in i for i in issues))
+
+
+class LinkCheckTest(unittest.TestCase):
+    def test_wiki_link_matches_hyphen_underscore_and_frontmatter_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory = root / "memory"
+            memory.mkdir()
+            (memory / "project_src.md").write_text(
+                "See [[feedback-stay-calm]] and [[project-renamed]].\n", encoding="utf-8"
+            )
+            (memory / "feedback_stay_calm.md").write_text("# rule\n", encoding="utf-8")
+            (memory / "project_other_20260101.md").write_text(
+                "---\nname: project-renamed\n---\n# renamed\n", encoding="utf-8"
+            )
+            spec = {"memory_roots": [{"id": "c", "path": "memory"}]}
+            named = memkit.all_named_memories(root, spec["memory_roots"])
+            self.assertEqual(memkit.link_issues(root, spec, named), [])
+
+    def test_exception_requires_reason(self) -> None:
+        allowed, issues = memkit.missing_link_exceptions(
+            {"known_missing_link_exceptions": [{"reference": "a.md->b.md", "reason": ""}]}
+        )
+        self.assertEqual(allowed, set())
+        self.assertTrue(any("reason required" in i for i in issues))
+
+
+class OrphanDuplicateTest(unittest.TestCase):
+    def test_orphan_and_duplicate_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = make_min_workspace(root)
+            (root / "memory" / "project_orphan.md").write_text("# lonely\n", encoding="utf-8")
+            (root / "memory" / "project_dupe.md").write_text("# fact\n", encoding="utf-8")
+            orphans = memkit.orphan_issues(root, spec)
+            self.assertTrue(any("project_orphan.md" in i for i in orphans))
+            dups = memkit.duplicate_issues(root, spec)
+            self.assertTrue(any("exact duplicate" in i for i in dups))
+
+
+class SymlinkTest(unittest.TestCase):
+    def _spec(self, root: Path) -> dict:
+        spec = make_min_workspace(root)
+        spec["links"] = [{"source": "memory", "target": "live/memory"}]
+        spec["link_backup_dir"] = "backups"
+        (root / "memory_spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        return spec
+
+    def test_dry_run_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec(root)
+            log, issues = memkit.apply_links(root, spec, dry_run=True)
+            self.assertEqual(issues, [])
+            self.assertFalse((root / "live").exists())
+
+    def test_link_backup_and_idempotency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec(root)
+            live = root / "live" / "memory"
+            live.mkdir(parents=True)
+            (live / "keep_me.md").write_text("precious\n", encoding="utf-8")
+
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertEqual(issues, [])
+            self.assertTrue(live.is_symlink())
+            backup = root / "backups" / "t1" / "memory" / "keep_me.md"
+            self.assertEqual(backup.read_text(encoding="utf-8"), "precious\n")
+
+            log2, issues2 = memkit.apply_links(root, spec, dry_run=False, now="t2")
+            self.assertEqual(issues2, [])
+            self.assertTrue(any("already linked" in line for line in log2))
+            self.assertFalse((root / "backups" / "t2").exists())
+
+    def test_wrong_symlink_is_retargeted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = self._spec(root)
+            other = root / "other"
+            other.mkdir()
+            live = root / "live" / "memory"
+            live.parent.mkdir(parents=True)
+            live.symlink_to(other)
+            log, issues = memkit.apply_links(root, spec, dry_run=False, now="t1")
+            self.assertEqual(issues, [])
+            self.assertEqual(live.resolve(), (root / "memory").resolve())
+            self.assertTrue(any("RELINK" in line for line in log))
+
+
+class CliTest(unittest.TestCase):
+    def test_check_requires_refresh_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_min_workspace(root)
+            code, out, err = run_cli(["check", "--workspace", str(root)])
+            self.assertEqual(code, 1)
+            self.assertIn("manifest missing", err)
+            code, out, err = run_cli(["refresh", "--workspace", str(root)])
+            self.assertEqual(code, 0)
+            self.assertIn("MEMKIT_CHECK=PASS", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
