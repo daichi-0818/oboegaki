@@ -1,6 +1,7 @@
-# agent-memory-kit
+# oboegaki
 
-**Durable, verifiable, file-based long-term memory for AI agents and humans.**
+**oboegaki (覚書) — Japanese for "memorandum": notes written down so they are not forgotten.**
+Durable, verifiable, file-based long-term memory for AI agents and humans.
 Markdown + Git + symlinks. No database, no embeddings, no LLM calls, no
 daemon, no API keys. One stdlib-only Python file.
 
@@ -40,7 +41,7 @@ re-approves the context. Stale memory is *detected*, not silently trusted.
 ## Quickstart
 
 ```bash
-git clone <this-repo> && cd agent-memory-kit
+git clone <this-repo> && cd oboegaki
 python3 memkit.py check --workspace samples/demo     # PASS on the shipped sample
 ```
 
